@@ -29,61 +29,55 @@ impl<'a> FrameToArraysMapper<'a> {
     }
 
     pub fn process_3d_slice(&self, iv: impl RangeBounds<usize>) -> BinaryArrayMap3D {
-        let n_scans = self.frame.scan_offsets.len();
+        // BRFP vendor patch (mobiusklein/mzdata#50): `scan_offsets` is a cumulative
+        // prefix-sum of peak OFFSETS into tof_indices/intensities, length
+        // `n_scan_rows + 1` (last entry = total peak count). Scan `k`'s peaks are
+        // tof_indices[scan_offsets[k] .. scan_offsets[k + 1]].
+        //
+        // The previous loop confused scan indices with these offsets: it only worked
+        // when first_scan == 0 (MS1 / first window) and otherwise prepended every
+        // earlier scan's peaks, stamped with one wrong mobility, inflating MS2 peak
+        // counts ~1.4-2.0x. It also labelled each scan's peaks with the *next* scan's
+        // mobility, and its end-bound arithmetic was inverted. This rewrite indexes
+        // scans directly: each scan is read exactly once with its own mobility.
+        let n_scan_rows = self.frame.scan_offsets.len() - 1;
 
         let first_scan = match iv.start_bound() {
             std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i,
+            std::ops::Bound::Excluded(i) => *i + 1,
             std::ops::Bound::Unbounded => 0,
-        };
+        }
+        .min(n_scan_rows);
 
         let final_scan = match iv.end_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i + 1,
-            std::ops::Bound::Unbounded => n_scans,
+            std::ops::Bound::Included(i) => *i + 1,
+            std::ops::Bound::Excluded(i) => *i,
+            std::ops::Bound::Unbounded => n_scan_rows,
         }
-        .min(n_scans);
+        .min(n_scan_rows);
 
-        let mut im_dimension = Vec::with_capacity(final_scan - first_scan + 1);
-        let mut arrays = Vec::with_capacity(final_scan - first_scan + 1);
+        let span = final_scan.saturating_sub(first_scan);
+        let mut im_dimension = Vec::with_capacity(span);
+        let mut arrays = Vec::with_capacity(span);
 
-        let mut scan_begin = first_scan;
-        for (i, mut scan_end) in self.frame.scan_offsets[first_scan..final_scan]
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            if scan_begin > self.frame.tof_indices.len() {
-                break;
-            }
-            if scan_end > self.frame.tof_indices.len() {
-                log::warn!(
-                    "Limiting scan_end {scan_end} for index {i} ({}, {})",
-                    self.frame.tof_indices.len(),
-                    self.frame.intensities.len()
-                );
-                scan_end = self.frame.tof_indices.len();
-            }
-            let width = scan_end.saturating_sub(scan_begin);
+        for scan in first_scan..final_scan {
+            let begin = self.frame.scan_offsets[scan];
+            let end = self.frame.scan_offsets[scan + 1].min(self.frame.tof_indices.len());
+            let width = end.saturating_sub(begin);
 
             let mut mz_array_bytes: Vec<u8> =
                 Vec::with_capacity(width * BinaryDataArrayType::Float64.size_of());
             let mut intensity_array_bytes: Vec<u8> =
                 Vec::with_capacity(width * BinaryDataArrayType::Float32.size_of());
 
-            self.frame.tof_indices[scan_begin..scan_begin + width]
-                .iter()
-                .for_each(|tof_idx| {
-                    mz_array_bytes.extend_from_slice(
-                        &self.metadata.mz_converter.convert(*tof_idx).to_le_bytes(),
-                    )
-                });
-            (scan_begin..(scan_begin + width)).for_each(|idx| {
-                intensity_array_bytes.extend_from_slice(
-                    &((self.frame.intensities[idx] as u64) as f32).to_le_bytes(),
-                );
+            self.frame.tof_indices[begin..end].iter().for_each(|tof_idx| {
+                mz_array_bytes
+                    .extend_from_slice(&self.metadata.mz_converter.convert(*tof_idx).to_le_bytes())
             });
-            let drift = self.metadata.im_converter.convert((i + first_scan) as u32);
+            self.frame.intensities[begin..end].iter().for_each(|intensity| {
+                intensity_array_bytes.extend_from_slice(&((*intensity as u64) as f32).to_le_bytes())
+            });
+            let drift = self.metadata.im_converter.convert(scan as u32);
             im_dimension.push(drift);
 
             let mut mz_array = DataArray::wrap(
@@ -104,7 +98,6 @@ impl<'a> FrameToArraysMapper<'a> {
             arrays_at.add(intensity_array);
             arrays_at.sort_by_array(&ArrayType::MZArray).unwrap();
             arrays.push(arrays_at);
-            scan_begin = scan_end;
         }
 
         // We read out the IM dimension in descending order, here we reverse it to be in ascending
