@@ -18,14 +18,35 @@ use crate::{
 
 use mzsignal::feature_mapping::{FeatureGraphBuilder, IMMSMapExtracter};
 
+use super::recalibration::TimsMobilityCalibration;
+
+/// scan -> 1/K0 using the vendor `TimsCalibration` recalibration when available, otherwise
+/// timsrust's linear converter. Keeps the two mobility call sites consistent.
+#[inline]
+fn scan_to_one_over_k0(
+    metadata: &Metadata,
+    recal: Option<&TimsMobilityCalibration>,
+    scan: u32,
+) -> f64 {
+    match recal {
+        Some(cal) => cal.one_over_k0(scan as f64),
+        None => metadata.im_converter.convert(scan),
+    }
+}
+
 pub struct FrameToArraysMapper<'a> {
     frame: &'a timsrust::Frame,
     metadata: &'a Metadata,
+    recal: Option<&'a TimsMobilityCalibration>,
 }
 
 impl<'a> FrameToArraysMapper<'a> {
-    pub fn new(frame: &'a timsrust::Frame, metadata: &'a Metadata) -> Self {
-        Self { frame, metadata }
+    pub fn new(
+        frame: &'a timsrust::Frame,
+        metadata: &'a Metadata,
+        recal: Option<&'a TimsMobilityCalibration>,
+    ) -> Self {
+        Self { frame, metadata, recal }
     }
 
     pub fn process_3d_slice(&self, iv: impl RangeBounds<usize>) -> BinaryArrayMap3D {
@@ -83,7 +104,8 @@ impl<'a> FrameToArraysMapper<'a> {
                     &((self.frame.intensities[idx] as u64) as f32).to_le_bytes(),
                 );
             });
-            let drift = self.metadata.im_converter.convert((i + first_scan) as u32);
+            let drift =
+                scan_to_one_over_k0(self.metadata, self.recal, (i + first_scan) as u32);
             im_dimension.push(drift);
 
             let mut mz_array = DataArray::wrap(
@@ -125,13 +147,14 @@ pub fn consolidate_peaks<CP: CentroidLike + From<CentroidPeak>>(
     arrays: &BinaryArrayMap3D,
     scan_range: &Range<u32>,
     metadata: &Metadata,
+    recal: Option<&TimsMobilityCalibration>,
     error_tolerance: Tolerance,
 ) -> Result<MZPeakSetType<CP>, ArrayRetrievalError> {
     let peaks: Result<Vec<_>, ArrayRetrievalError> = scan_range
         .clone()
         .rev()
         .map(|i| -> Result<(f64, PeakSet), ArrayRetrievalError> {
-            let im = metadata.im_converter.convert(i);
+            let im = scan_to_one_over_k0(metadata, recal, i);
             if let Some(arrays_point) = arrays.get_ion_mobility(im) {
                 let mzs = arrays_point.mzs()?;
                 let intens = arrays_point.intensities()?;

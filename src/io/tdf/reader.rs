@@ -45,6 +45,7 @@ use timsrust::{
 pub use super::arrays::FrameToArraysMapper;
 use super::{
     arrays::consolidate_peaks,
+    recalibration::TimsMobilityCalibration,
     constants::{InstrumentSource, MsMsType},
     sql::{
         ChromatographyData, FromSQL, PasefPrecursor, RawTDFSQLReader, SQLDIAFrameMsMsWindow,
@@ -148,6 +149,9 @@ pub struct TDFFrameReaderType<
     metadata: timsrust::Metadata,
     frame_reader: timsrust::readers::FrameReader,
     tdf_reader: RawTDFSQLReader,
+    /// Vendor `TimsCalibration` ModelType-2 scan->1/K0 recalibration; `None` falls back to
+    /// timsrust's linear conversion (non-ModelType-2 or missing calibration).
+    mobility_recal: Option<TimsMobilityCalibration>,
     entry_index: Vec<IndexExtry>,
     index: usize,
     offset_index: OffsetIndex,
@@ -209,10 +213,18 @@ impl<C: FeatureLike<MZ, IonMobility>, D: FeatureLike<Mass, IonMobility> + KnownC
         let tdf_reader = RawTDFSQLReader::new(&tdf_path)
             .map_err(|e| TimsRustError::FrameReaderError(FrameReaderError::SqlError(e.into())))?;
 
+        // Vendor-grade scan->1/K0 recalibration from the TimsCalibration ModelType-2 model; `None`
+        // (non-ModelType-2 or unreadable) keeps timsrust's linear conversion.
+        let mobility_recal = {
+            let conn = tdf_reader.connection();
+            TimsMobilityCalibration::from_connection(&conn)
+        };
+
         let mut this = Self {
             metadata,
             frame_reader,
             tdf_reader,
+            mobility_recal,
             entry_index: Vec::new(),
             index: 0,
             offset_index: OffsetIndex::new("spectrum".into()),
@@ -537,6 +549,7 @@ impl<C: FeatureLike<MZ, IonMobility>, D: FeatureLike<Mass, IonMobility> + KnownC
                         &arrays,
                         &(0..arrays.ion_mobility_dimension.len() as u32),
                         &self.metadata,
+                        self.mobility_recal.as_ref(),
                         error_tolerance,
                     )
                     .ok()
@@ -582,7 +595,7 @@ impl<C: FeatureLike<MZ, IonMobility>, D: FeatureLike<Mass, IonMobility> + KnownC
                         "Extracting {index} as PasefFrameMsMs with range {:?}",
                         pasef.scan_start..pasef.scan_end
                     );
-                    let arrays = FrameToArraysMapper::new(&frame, &self.metadata)
+                    let arrays = FrameToArraysMapper::new(&frame, &self.metadata, self.mobility_recal.as_ref())
                         .process_3d_slice(pasef.scan_start..pasef.scan_end);
                     Some(arrays)
                 } else if let Some(dia_pasef) = entry.dia_window() {
@@ -590,11 +603,11 @@ impl<C: FeatureLike<MZ, IonMobility>, D: FeatureLike<Mass, IonMobility> + KnownC
                         "Extracting {index} as DIAFrameMsMsWindow with range {:?}",
                         dia_pasef.scan_start..dia_pasef.scan_end
                     );
-                    let arrays = FrameToArraysMapper::new(&frame, &self.metadata)
+                    let arrays = FrameToArraysMapper::new(&frame, &self.metadata, self.mobility_recal.as_ref())
                         .process_3d_slice(dia_pasef.scan_start..dia_pasef.scan_end);
                     Some(arrays)
                 } else {
-                    Some(FrameToArraysMapper::new(&frame, &self.metadata).process_3d_slice(..))
+                    Some(FrameToArraysMapper::new(&frame, &self.metadata, self.mobility_recal.as_ref()).process_3d_slice(..))
                 }
             } else {
                 None
@@ -1052,6 +1065,7 @@ impl<
             tdf_reader: view.tdf_reader,
             metadata: view.metadata,
             frame_reader: view.frame_reader,
+            mobility_recal: view.mobility_recal,
             entry_index: view.entry_index,
             index: view.index,
             offset_index: view.offset_index,
@@ -1298,6 +1312,7 @@ impl<
                 &arrays,
                 &(0..arrays.ion_mobility_dimension.len() as u32),
                 &self.frame_reader.metadata,
+                self.frame_reader.mobility_recal.as_ref(),
                 self.peak_merging_tolerance,
             )?);
         };
