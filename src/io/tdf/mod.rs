@@ -7,8 +7,10 @@
 //! file reading behaviors and [`rusqlite`] for reading the SQLite3 .tdf files.
 mod constants;
 mod arrays;
+mod recalibration;
 mod sql;
 mod reader;
 
 pub use reader::{TDFFrameReader, TDFFrameReaderType, TDFSpectrumReader, TDFSpectrumReaderType, is_tdf};
+pub use recalibration::TimsMobilityCalibration;
 pub use sql::{ChromatographyData, SQLTrace};
